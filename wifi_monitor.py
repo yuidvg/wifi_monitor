@@ -14,6 +14,9 @@ import socket
 import time
 
 RETENTION = 30 * 24 * 60 * 60
+DNS_NAME = "www.apple.com"
+SLOW_DNS_SECONDS = 2.0
+TAILSCALE_RESOLVERS = ("100.100.100.100", "fd7a:115c:a1e0::53")
 LOG_PREDICATE = '''
 (process == "airportd" AND (
   eventMessage CONTAINS "LQM: rssi=" OR
@@ -29,18 +32,20 @@ LOG_PREDICATE = '''
 
 
 def run(args, timeout=8, limit=65536):
+    started_epoch = time.time()
     started = time.monotonic()
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         return {
             "exit_code": result.returncode,
+            "started_epoch": started_epoch,
             "elapsed_s": round(time.monotonic() - started, 3),
             "stdout": result.stdout[-limit:],
             "stderr": result.stderr[-4096:],
             "truncated": len(result.stdout) > limit,
         }
     except subprocess.TimeoutExpired:
-        return {"exit_code": None, "error": "timeout", "timeout_s": timeout}
+        return {"exit_code": None, "started_epoch": started_epoch, "error": "timeout", "timeout_s": timeout}
     except OSError as error:
         return {"exit_code": None, "error": str(error)}
 
@@ -128,6 +133,61 @@ def wifi_reading():
         return None
 
 
+def configured_tailscale_dns(config):
+    servers = re.findall(r"^\s*nameserver\[\d+\]\s*:\s*(\S+)", config.get("stdout", ""), re.M)
+    return next((ip for ip in TAILSCALE_RESOLVERS if ip in servers), None)
+
+
+def direct_dns(server):
+    return ["/usr/bin/dig", "@" + server, DNS_NAME + ".", "A", "+time=5", "+tries=1",
+            "+noall", "+comments", "+answer", "+stats"]
+
+
+def dns_timings(row):
+    """Read current or older saved probes. Missing probes have no timing."""
+    timings = {}
+    for key in ("dns_lookup", "https", "tailscale_dns", "gateway_dns", "public_dns"):
+        probe = row.get(key)
+        if not probe:
+            continue
+        output = probe.get("stdout", "")
+        status = "error"
+        seconds = probe.get("elapsed_s")
+        if key == "https":
+            # curl reports zero for time_namelookup when resolving times out.
+            timeout = re.search(r"resolving timed out after (\d+) milliseconds", probe.get("stderr", ""), re.I)
+            match = re.search(r"\bdns=(\d+(?:\.\d+)?)", output)
+            if timeout:
+                status, seconds = "timeout", int(timeout[1]) / 1000
+            elif match and float(match[1]) > 0:
+                status, seconds = "ok", float(match[1])
+            else:
+                continue  # A connection or transfer timeout is not a DNS timing.
+        elif probe.get("error") == "timeout":
+            status, seconds = "timeout", probe.get("timeout_s")
+        elif key == "dns_lookup":
+            if probe.get("exit_code") == 0 and re.search(r"^\s*(?:ipv6_)?ip_address:", output, re.M):
+                status = "ok"
+        elif probe.get("exit_code") == 0:
+            match = re.search(r"Query time:\s*(\d+) msec", output)
+            if match:
+                seconds = int(match[1]) / 1000
+            if "status: NOERROR" in output and re.search(r"\bIN\s+A\s+[0-9.]+", output):
+                status = "ok"
+        elif "timed out" in (output + probe.get("stderr", "")).lower():
+            status = "timeout"
+        timings[key] = {"status": status, "seconds": seconds}
+    return timings
+
+
+def slow_dns_paths(timings):
+    return [key for key, result in timings.items()
+            if key != "public_dns"
+            and (result["status"] == "ok" or
+                 (key in ("dns_lookup", "https") and result["status"] == "timeout"))
+            and result["seconds"] is not None and result["seconds"] >= SLOW_DNS_SECONDS]
+
+
 def collect(directory, now):
     existing = sorted(directory.glob("sample-*.json"))
     previous = int(existing[-1].stem.split("-")[1]) if existing else now - 90
@@ -147,38 +207,43 @@ def collect(directory, now):
     route = run(["/sbin/route", "-n", "get", "default"])
     dhcp_router = run(["/usr/sbin/ipconfig", "getoption", interface, "router"])
     gateway = dhcp_router.get("stdout", "").strip().splitlines()
+    dns_config = run(["/usr/sbin/scutil", "--dns"])
+    tailscale_dns = configured_tailscale_dns(dns_config)
     probes = {
         "interface": ["/sbin/ifconfig", interface],
         "dhcp": ["/usr/sbin/ipconfig", "getsummary", interface],
-        "dns_config": ["/usr/sbin/scutil", "--dns"],
         "network": ["/usr/sbin/scutil", "--nwi"],
         "counters": ["/usr/sbin/netstat", "-I", interface, "-b", "-d"],
         "internet_ping": ["/sbin/ping", "-n", "-c", "3", "-W", "1000", "1.1.1.1"],
         "internet_ping_second": ["/sbin/ping", "-n", "-c", "3", "-W", "1000", "8.8.8.8"],
         "internet_route": ["/sbin/route", "-n", "get", "1.1.1.1"],
-        "public_dns": ["/usr/bin/dig", "@1.1.1.1", "www.apple.com", "+time=2", "+tries=1", "+noall", "+comments", "+answer"],
-        "dns_lookup": ["/usr/bin/dscacheutil", "-q", "host", "-a", "name", "www.apple.com"],
+        "public_dns": direct_dns("1.1.1.1"),
+        "dns_lookup": ["/usr/bin/dscacheutil", "-q", "host", "-a", "name", DNS_NAME],
         "https": ["/usr/bin/curl", "--silent", "--show-error", "--noproxy", "*",
                   "--connect-timeout", "3", "--max-time", "6", "--output", "/dev/null",
                   "--write-out", "%{http_code} dns=%{time_namelookup} connect=%{time_connect} total=%{time_total}\n",
                   "https://www.apple.com/library/test/success.html"],
     }
+    if tailscale_dns:
+        probes["tailscale_dns"] = direct_dns(tailscale_dns)
     if gateway and re.fullmatch(r"[0-9.]+", gateway[0]):
         probes["gateway_ping"] = ["/sbin/ping", "-n", "-c", "3", "-W", "1000", "-b", interface, gateway[0]]
         probes["gateway_arp"] = ["/usr/sbin/arp", "-n", gateway[0]]
         probes["gateway_route"] = ["/sbin/route", "-n", "get", gateway[0]]
-        probes["gateway_dns"] = ["/usr/bin/dig", "@" + gateway[0], "www.apple.com", "+time=2", "+tries=1", "+noall", "+comments", "+answer"]
+        probes["gateway_dns"] = direct_dns(gateway[0])
     probes["wifi_events"] = ["/usr/bin/log", "show", "--last", f"{lookback}s",
                              "--style", "ndjson", "--predicate", LOG_PREDICATE.replace("en0", interface)]
     detailed = now // 60 != last_detail // 60
     if not detailed:
         probes = {k: v for k, v in probes.items() if k in (
-            "gateway_ping", "internet_ping", "internet_ping_second", "internet_route", "public_dns", "gateway_dns")}
+            "gateway_ping", "internet_ping", "internet_ping_second", "internet_route",
+            "public_dns", "gateway_dns", "tailscale_dns", "dns_lookup")}
     snapshot = {
-        "schema": 3, "epoch": now, "host": socket.gethostname(), "wifi": wifi_reading(),
+        "schema": 4, "epoch": now, "host": socket.gethostname(), "wifi": wifi_reading(),
         "timestamp": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
         "wifi_interface": interface, "default_route": route, "dhcp_router": dhcp_router,
         "log_lookback_s": lookback,
+        "tailscale_dns_configured": bool(tailscale_dns) if dns_config.get("exit_code") == 0 else None,
     }
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(probes) + 3) as pool:
         futures = {name: pool.submit(run, args, 15 if name == "wifi_events" else 8,
@@ -190,7 +255,9 @@ def collect(directory, now):
         snapshot.update({name: future.result() for name, future in futures.items()})
         snapshot.update({name: future.result() for name, future in tcp_futures.items()})
     if detailed:
+        snapshot["dns_config"] = dns_config
         snapshot["radio"] = compact_events(snapshot["wifi_events"])
+    snapshot["dns_timings"] = dns_timings(snapshot)
     # Independent fallback when macOS omits LQM logs. Avoid scanning every minute.
     if now // 300 != last_profiler // 300:
         snapshot["wifi_details"] = run(["/usr/sbin/system_profiler", "SPAirPortDataType", "-json"], 20)
@@ -225,7 +292,7 @@ def records(directory, since):
 def summary(directory, hours):
     totals = {"samples": 0, "gateway_ping_loss": 0, "gateway_tcp_unresponsive": 0,
               "both_external_pings_failed": 0, "router_dns_failed": 0,
-              "public_dns_failed": 0, "https_failed": 0}
+              "public_dns_failed": 0, "https_failed": 0, "slow_dns_samples": 0}
     legacy_counts = {"samples": 0, "external_ping_failed": 0, "dns_failed": 0}
     signal = []
     size = sum(p.stat().st_size for p in directory.glob("samples-*.jsonl.gz"))
@@ -241,6 +308,7 @@ def summary(directory, hours):
             legacy_counts["dns_failed"] += legacy.get("dns_status") != "NOERROR"
             totals["gateway_ping_loss"] += bool(legacy.get("gateway") and legacy.get("gateway_ms") is None)
             continue
+        totals["slow_dns_samples"] += bool(slow_dns_paths(dns_timings(row)))
         for r in row.get("radio", []):
             if "rssi" in r:
                 signal.append(r["rssi"])
