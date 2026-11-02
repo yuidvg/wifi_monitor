@@ -1,5 +1,6 @@
 import unittest
 
+from compare_dns import compare
 from wifi_monitor import configured_tailscale_dns, dns_timings, slow_dns_paths
 
 
@@ -35,6 +36,32 @@ class DnsTimingTest(unittest.TestCase):
         self.assertIsNone(configured_tailscale_dns({"stdout": "nameserver[0] : 192.0.2.1"}))
         self.assertEqual(configured_tailscale_dns({"stdout": "  nameserver[1] : fd7a:115c:a1e0::53"}),
                          "fd7a:115c:a1e0::53")
+
+
+class TwoMacComparisonTest(unittest.TestCase):
+    @staticmethod
+    def sample(epoch, **seconds):
+        return {"epoch": epoch, "timings": {key: {"status": "ok", "seconds": s}
+                                            for key, s in seconds.items()}}
+
+    def test_both_checks_all_samples_in_window_and_names_each_path(self):
+        main = self.sample(100, dns_lookup=2)
+        peers = [self.sample(99, dns_lookup=0.01), self.sample(130, gateway_dns=2.4)]
+        result = compare(main, peers)
+        self.assertEqual((result["scope"], result["peer_slow"], result["offset_s"]),
+                         ("both", ["gateway_dns"], 30))
+        self.assertEqual(compare(main, [self.sample(131, dns_lookup=2.2)])["scope"], "unconfirmed")
+
+    def test_main_only_requires_success_for_the_affected_paths(self):
+        main = self.sample(100, dns_lookup=2.8, https=2.1)
+        fast = self.sample(97, dns_lookup=0.1, https=0.3)
+        self.assertEqual(compare(main, [fast], peer_latest=130)["scope"], "main_only")
+        self.assertEqual(compare(main, [fast], peer_latest=129)["scope"], "unconfirmed")
+        for peer in (self.sample(99, dns_lookup=0.01), self.sample(101)):
+            self.assertEqual(compare(main, [peer], peer_latest=130)["scope"], "unconfirmed")
+        incomplete = self.sample(100)
+        incomplete["timings"]["dns_lookup"] = {"status": "error", "seconds": None}
+        self.assertEqual(compare(main, [fast, incomplete], peer_latest=130)["scope"], "unconfirmed")
 
 
 if __name__ == "__main__":
